@@ -60,7 +60,7 @@ const float winddirections[] = { 315.0, 247.5, 292.5, 270.0,
                                  67.5, 135.0, 90.0, 112.5,
                                  45.0, 157.5, 22.5, 180.0 };
 const char channelID[] = {'C','D','B','A'};
-const int uploadDevice[2]  PROGMEM = {0x1D,0x20}; 
+const int uploadDevice[2]  PROGMEM = {0x1D,0x20}; //Device ID and Channel of device you want to upload
 // wx message types
 #define  MT_WS_WD_RF  49    // wind speed, wind direction, rainfall
 #define  MT_WS_T_RH   56    // wind speed, temp, RH
@@ -68,10 +68,8 @@ const int uploadDevice[2]  PROGMEM = {0x1D,0x20};
 
 //WundergroundStuff
 
-//const String WUnderID PROGMEM = "XXXXXXX";
-//const String WUnderPW PROGMEM = "YYYYYYY";
 //const String WUnderURL PROGMEM = "https://rtupdate.wunderground.com/weatherstation/updateweatherstation.php?action=updateraw&dateutc=now&realtime=1&rtfreq=15";
-//const String WunderOpts[] PROGMEM = {"&ID=","&PASSWORD=","&winddir=","&windspeedmph=","&windgustmph=","&humidity=","&tempf=","&rainin=","&baromin=","&dewptf="};
+//const String WunderOpts[] PROGMEM = {"&ID=","&PASSWORD=","&winddir=","&windspeedmph=","&windgustmph=","&humidity=","&tempf=","&rainin=","&baromin=","&dewptf="}; //First 2 are Station ID and Key
 //String WunderVal[9];
 
 
@@ -89,8 +87,6 @@ void setup() {
   #endif
   attachInterrupt(0, My_ISR, CHANGE);
 
-//  WunderVal[0] = WUnderID;
- // WunderVal[1] = WUnderPW;
 }
 
 int freeRam () {
