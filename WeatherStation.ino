@@ -4,12 +4,11 @@
   for arduino and 433 MHz OOK RX module
   Note: use superhet (with xtal) rx board
   the regen rx boards are too noisy
-
  Jens Jensen, (c)2015
 *****************************************/
 #include <EEPROM.h>
 #include <PGMWrap.h>
-
+#include <RingBuf.h>
 
 // pulse timings
 // SYNC
@@ -44,8 +43,10 @@ volatile unsigned int    pulsecnt = 0;
 volatile unsigned long   risets = 0;     // track rising edge time
 volatile unsigned int    syncpulses = 0; // track sync pulses
 volatile byte            state = RESET;  
-volatile byte            buf[8] = {0,0,0,0,0,0,0,0};  // msg frame buffer
-volatile bool            reading = false;            // have valid reading
+ byte            buf[8] = {0,0,0,0,0,0,0,0};  // processing message frame buffer
+ byte            recBuf[8] = {0,0,0,0,0,0,0,0}; // Receive msg frame buffer
+
+RingBuf *rngBuf = RingBuf_new(sizeof(buf),5);
 
 unsigned int   raincounter = 0;
 unsigned int   EEMEM raincounter_persist;    // persist raincounter in eeprom
@@ -97,14 +98,12 @@ int freeRam () {
 
 void loop() {
 
-  //Serial.print("Reading: ");
-  //Serial.println(reading);
+
   
-  if (reading)
+  if (!rngBuf->isEmpty(rngBuf))
   {
-    // reading found
-    noInterrupts();
-    
+    rngBuf->pull(rngBuf, &buf);
+   
     if (acurite_crc(buf, sizeof(buf))) {
       // passes crc, good message 
       #ifdef DEBUG
@@ -180,10 +179,6 @@ void loop() {
     }
 
     digitalWrite(LED, LOW);
-    reading=false;
-
-    interrupts();
-
   }
 
   //delay(100);
@@ -369,6 +364,7 @@ void My_ISR()
 {
   // decode the pulses
   unsigned long timestamp = micros();
+  
   if (digitalRead(PIN) == HIGH) {
     // going high, start timing
     if (timestamp - risets > RESETTIME) {
@@ -418,9 +414,13 @@ void My_ISR()
     // SYNCDONE, now look for message 
     // detect if finished here
     if ( pulsecnt > MAXBITS ) {
+      noInterrupts();
       state = RESET;
       pulsecnt = 0;
-      reading = true;
+      if (!rngBuf->isFull(rngBuf)) {
+        rngBuf->add(rngBuf, &recBuf);
+      }
+      interrupts();
       return;
     }
     // stuff buffer with message
@@ -438,4 +438,52 @@ void My_ISR()
     }
   
   }
+}
+void TestISR()
+{
+  int i;
+  char readbuf[16];
+  Serial.println("Awaiting input");
+  Serial.setTimeout(60000);
+  Serial.readBytes(readbuf,16);
+
+  for (i=0;i<16;i+=2)
+    {
+    buf[i/2]=x2i(&readbuf[i]);
+    }
+  
+  Serial.print("Value : ");
+  
+  for (i=0;i<8;i++)
+  {
+   Serial.print(buf[i],HEX);
+   Serial.print(" ");
+  }
+
+}
+
+int x2i(char *s) 
+{
+ int i;
+ int x = 0;
+ for(i=0;i<2;i++) {
+   char c = *s;
+   Serial.print(c);
+   if (c >= '0' && c <= '9') {
+      x *= 16;
+      x += c - '0'; 
+   }
+   else if (c >= 'A' && c <= 'F') {
+      x *= 16;
+      x += (c - 'A') + 10; 
+   }
+   else if (c >= 'a' && c <= 'f') {
+      x *= 16;
+      x += (c - 'a') + 10;   
+   }
+   else break;
+   s++;
+ }
+  Serial.println();
+ return x;
 }
