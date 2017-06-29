@@ -1,489 +1,699 @@
-/*****************************************
- accurite 5n1 weather station decoder
-  
-  for arduino and 433 MHz OOK RX module
-  Note: use superhet (with xtal) rx board
-  the regen rx boards are too noisy
- Jens Jensen, (c)2015
-*****************************************/
-#include <EEPROM.h>
-#include <PGMWrap.h>
-#include <RingBuf.h>
+/**********************************************************************
+ * Arduino code decode several Acurite devices OTA data stream.
+ * 
+ * Decoding protocol and prototype code from these sources:
+ * Ray Wang (Rayshobby LLC) 
+ *   http://rayshobby.net/?p=8998
+ * Benjamin Larsson (RTL_433) 
+ *   https://github.com/merbanan/rtl_433
+ * Brad Hunting (Acurite_00592TX_sniffer) 
+ *   https://github.com/bhunting/Acurite_00592TX_sniffer
+ *
+ * Written and tested on an Arduino Uno R3 Compatible Board
+ * using a RXB6 433Mhz Superheterodyne Wireless Receiver Module
+ * 
+ * This works with these devices but more could be added
+ *   Acurite Pro 5-in-1 (8 bytes)
+ *    https://tinyurl.com/zwsl9oj
+ *   Acurite Ligtning Detector 06045M  (9 bytes)
+ *    https://tinyurl.com/y7of6dq4
+ *   Acurite Room Temp and Humidity 06044M (7 bytes)
+ *    https://tinyurl.com/yc9fpx8q
+ */
 
-// pulse timings
-// SYNC
-#define SYNC_HI      675
-#define SYNC_LO      575
+// ring buffer size has to be large enough to fit
+// data and sync signal, at least 120
+// round up to 128 for now
+#define RING_BUFFER_SIZE  152
 
-// HIGH == 1
-#define LONG_HI      450
-#define LONG_LO      375
+#define SYNC_HIGH       600
+#define SYNC_LOW        600
 
-// SHORT == 0
-#define SHORT_HI     250
-#define SHORT_LO     175
+#define PULSE_LONG      400
+#define PULSE_SHORT     220
 
-#define RESETTIME    10000
+#define PULSE_RANGE     100
 
-// other settables
-#define LED          13
-#define PIN           2  // data pin from 433 RX module
-#define MAXBITS      65  // max framesize
+//#define BIT1_HIGH       PULSE_LONG
+//#define BIT1_LOW        PULSE_SHORT
+//#define BIT0_HIGH       PULSE_SHORT
+//#define BIT0_LOW        PULSE_LONG
 
-#define DEBUG         1  // uncomment to enable debugging
-#define DEBUGPIN     A0  // pin for triggering logic analyzer
-#define METRIC_UNITS  0  // select display of metric or imperial units
+//BIT1
+#define BIT1_HIGH_MIN  (PULSE_LONG-PULSE_RANGE)
+#define BIT1_HIGH_MAX  (PULSE_LONG+PULSE_RANGE)
+#define BIT1_LOW_MIN   (PULSE_SHORT-PULSE_RANGE)
+#define BIT1_LOW_MAX   (PULSE_SHORT+PULSE_RANGE)
 
-// sync states
-#define RESET     0   // no sync yet
-#define INSYNC    1   // sync pulses detected 
-#define SYNCDONE  2   // complete sync header received 
+//BIT0
+#define BIT0_HIGH_MIN  (PULSE_SHORT-PULSE_RANGE)
+#define BIT0_HIGH_MAX  (PULSE_SHORT+PULSE_RANGE)
+#define BIT0_LOW_MIN   (PULSE_LONG-PULSE_RANGE)
+#define BIT0_LOW_MAX   (PULSE_LONG+PULSE_RANGE)
 
-volatile unsigned int    pulsecnt = 0; 
-volatile unsigned long   risets = 0;     // track rising edge time
-volatile unsigned int    syncpulses = 0; // track sync pulses
-volatile byte            state = RESET;  
- byte            buf[8] = {0,0,0,0,0,0,0,0};  // processing message frame buffer
- byte            recBuf[8] = {0,0,0,0,0,0,0,0}; // Receive msg frame buffer
 
-RingBuf *rngBuf = RingBuf_new(sizeof(buf),5);
+// On the arduino connect the data pin, the pin that will be 
+// toggling with the incomming data from the RF module, to
+// digital pin 3. Pin D3 is interrupt 1 and can be configured
+// for interrupt on change, change to high or low.
+// The squelch pin in an input to the radio that squelches, or
+// blanks the incoming data stream. Use the squelch pin to 
+// stop the data stream and prevent interrupts between the 
+// data packets if desired.
+//
+#define DATAPIN         (3)             // D3 is interrupt 1
+#define LAPIN           (5)             //logic Analyzer PIN
+#define SQUELCHPIN      (4)
+#define SYNCPULSECNT    (4)             // 4 pulses (8 edges)
+#define SYNCPULSEEDGES  (SYNCPULSECNT*2)
 
-unsigned int   raincounter = 0;
-unsigned int   EEMEM raincounter_persist;    // persist raincounter in eeprom
-#define  MARKER  0x5AA5
-unsigned int   EEMEM eeprom_marker = MARKER; // indicate if we have written to eeprom or not before
+#define DATABYTESCNT_MIN (7) // Minimum number of data bytes
+#define DATABITSCNT_MIN     (DATABYTESCNT_MIN*8)// 7 bytes * 8 bits
+#define DATABITSEDGES_MIN   (DATABITSCNT_MIN*2)
 
-// wind directions:
-// { "NW", "WSW", "WNW", "W", "NNW", "SW", "N", "SSW",
-//   "ENE", "SE", "E", "ESE", "NE", "SSE", "NNE", "S" };
-const float winddirections[] = { 315.0, 247.5, 292.5, 270.0, 
-                                 337.5, 225.0, 0.0, 202.5,
-                                 67.5, 135.0, 90.0, 112.5,
-                                 45.0, 157.5, 22.5, 180.0 };
-const char channelID[] = {'C','D','B','A'};
-const int uploadDevice[2]  PROGMEM = {0x1D,0x20}; //Device ID and Channel of device you want to upload
-// wx message types
+#define DATABYTESCNT_MID 128 //8 Bytes
+
+#define DATABYTESCNT_MAX (9) // 9 Bytes
+#define DATABITSCNT_MAX     (DATABYTESCNT_MAX*8)// 7 bytes * 8 bits
+#define DATABITSEDGES_MAX   (DATABITSCNT_MAX*2)
+
+// 5n1 Tower Message Types
 #define  MT_WS_WD_RF  49    // wind speed, wind direction, rainfall
 #define  MT_WS_T_RH   56    // wind speed, temp, RH
 
 
-//WundergroundStuff
+// The pulse durations are the measured time in micro seconds between
+// pulse edges.
+unsigned long pulseDurations[RING_BUFFER_SIZE];
+unsigned int syncIndex  = 0;    // index of the last bit time of the sync signal
+unsigned int dataIndex  = 0;    // index of the first bit time of the data bits (syncIndex+1)
+bool         syncFound = false; // true if sync pulses found
+bool         received  = false; // true if sync plus enough bits found
+unsigned int changeCount = 0;
+unsigned int bytesReceived = 0;
 
-//const String WUnderURL PROGMEM = "https://rtupdate.wunderground.com/weatherstation/updateweatherstation.php?action=updateraw&dateutc=now&realtime=1&rtfreq=15";
-//const String WunderOpts[] PROGMEM = {"&ID=","&PASSWORD=","&winddir=","&windspeedmph=","&windgustmph=","&humidity=","&tempf=","&rainin=","&baromin=","&dewptf="}; //First 2 are Station ID and Key
-//String WunderVal[9];
+int acurite_5n1_raincounter = 0;
+int rainWrapOffset = 0;
+int lastRainCount = 0;
+
+int strikeTot = 0;
+int strikeWrapOffset = 0;
 
 
+//const unsigned int tempOffset = 2.4;  // offset in degrees C
+//const unsigned int tempOffset = 0;  // offset in degrees C
+//const unsigned int tempOffset10th = 24;  // offset in 10th degrees C
+const unsigned int tempOffset10th = 0;  // offset in 10th degrees C
 
-void setup() {
-  // put your setup code here, to run once:
-  Serial.begin(9600); 
-  Serial.println(F("Starting Acurite5n1 433 WX Decoder v0.2 ..."));
-  pinMode(PIN, INPUT);
-  raincounter = getRaincounterEEPROM();
-  #ifdef DEBUG
-    // setup a pin for triggering logic analyzer for debugging pulse train
-    pinMode(DEBUGPIN, OUTPUT);
-    digitalWrite(DEBUGPIN, HIGH);
-  #endif
-  attachInterrupt(0, My_ISR, CHANGE);
+const float winddirections[] = { 315.0, 247.5, 292.5, 270.0, 
+                                 337.5, 225.0, 0.0, 202.5,
+                                 67.5, 135.0, 90.0, 112.5,
+                                 45.0, 157.5, 22.5, 180.0 };
+                                 
+char * acurite_5n1_winddirection_str[] =
+    {"NW",  // 0  315
+     "WSW", // 1  247.5
+     "WNW", // 2  292.5
+     "W",   // 3  270
+     "NNW", // 4  337.5
+     "SW",  // 5  225
+     "N",   // 6  0
+     "SSW", // 7  202.5
+     "ENE", // 8  67.5
+     "SE",  // 9  135
+     "E",   // 10 90
+     "ESE", // 11 112.5
+     "NE",  // 12 45
+     "SSE", // 13 157.5
+     "NNE", // 14 22.5
+     "S"};  // 15 180
+ 
+/*
+ * helper code to print formatted hex 
+ */
+void PrintHex8(uint8_t *data, uint8_t length) // prints 8-bit data in hex
+{
+ char tmp[length*2+1];
+ byte first;
+ int j = 0;
+ for (uint8_t i = 0; i < length; i++) 
+ {
+   first = (data[i] >> 4) | 48;
+   if (first > 57) tmp[j] = first + (byte)39;
+   else tmp[j] = first ;
+   j++;
 
+   first = (data[i] & 0x0F) | 48;
+   if (first > 57) tmp[j] = first + (byte)39; 
+   else tmp[j] = first;
+   j++;
+ }
+ tmp[length*2] = 0;
+ Serial.print(tmp);
 }
 
-int freeRam () {
-  extern int __heap_start, *__brkval; 
-  int v; 
-  return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval); 
-}
 
-void loop() {
-
-
-  
-  if (!rngBuf->isEmpty(rngBuf))
-  {
-    rngBuf->pull(rngBuf, &buf);
-   
-    if (acurite_crc(buf, sizeof(buf))) {
-      // passes crc, good message 
-      #ifdef DEBUG
-        print_CRC(F("5n1 CRC"));
-      #endif
+/*
+ * Look for the sync pulse train, 4 high-low pulses of
+ * 600 uS high and 600 uS low.
+ * idx is index of last captured bit duration.
+ * Search backwards 8 times looking for 4 pulses
+ * approximately 600 uS long.
+ */
+bool isSync(unsigned int idx) 
+{
+   // check if we've received 4 pulses of matching timing
+   for( int i = 0; i < SYNCPULSEEDGES; i += 2 )
+   {
+      unsigned long t1 = pulseDurations[(idx+RING_BUFFER_SIZE-i) % RING_BUFFER_SIZE];
+      unsigned long t0 = pulseDurations[(idx+RING_BUFFER_SIZE-i-1) % RING_BUFFER_SIZE];    
       
-      digitalWrite(LED, HIGH);     
-      //identifyDevice();
-      float windspeedkph = getWindSpeed(buf[3], buf[4]);
-      //WunderVal[3] = String(convKphMph(windspeedkph),1);  //WindSpeed
-      Serial.print("windspeed: ");
-      if (METRIC_UNITS) {
-        Serial.print(windspeedkph, 1);
-        Serial.print(" km/h, ");
-      } else {
-        Serial.print(convKphMph(windspeedkph),1);
-        Serial.print(" mph, ");
-      }       
-
-      int msgtype = (buf[2] & 0x3F);
-      if (msgtype == MT_WS_WD_RF) {
-        // wind speed, wind direction, rainfall
-        float rainfall = 0.00;
-        unsigned int curraincounter = getRainfallCounter(buf[5], buf[6]);
-        updateRaincounterEEPROM(curraincounter);
-        if (raincounter > 0) {
-          // track rainfall difference after first run
-          rainfall = (curraincounter - raincounter) * 0.01;
-        } else {
-          // capture starting counter
-          raincounter = curraincounter; 
-        }
-
-        float winddir = getWindDirection(buf[4]);
-        //WunderVal[2] = String(winddir,0);  //WindDirection
-        Serial.print("wind direction: ");
-        Serial.print(winddir, 1);
-        Serial.print(", rain gauge: ");
-        if (METRIC_UNITS) {
-          Serial.print(convInMm(rainfall), 1);
-          Serial.print(" mm");
-        } else {
-          Serial.print(rainfall, 2);
-          Serial.print(" inches");
-        }
-       // WunderVal[7] = String(rainfall,2);  //RainFall
-      } else if (msgtype == MT_WS_T_RH) {
-        TempAndHumid(false);
-      } else {
-        #ifdef DEBUG
-          print_CRC(F("Unknown MsgType"));
-        #endif
+      // any of the preceeding 8 pulses are out of bounds, short or long,
+      // return false, no sync found
+      if( t0<(SYNC_HIGH-PULSE_RANGE) || t0>(SYNC_HIGH+PULSE_RANGE) ||
+          t1<(SYNC_LOW-PULSE_RANGE)  || t1>(SYNC_LOW+PULSE_RANGE) )
+      {
+         return false;
       }
-      // time
-      unsigned int timesincestart = millis()/60/1000;
-      Serial.print(", mins since start: ");
-      Serial.print(timesincestart);     
-      Serial.println();
-      
-    } 
-    else if (acurite_crc(buf, sizeof(buf)-1)) {
-      #ifdef DEBUG
-        print_CRC(F("Small CRC"));
-      #endif
-     identifyDevice();
-     TempAndHumid(true);
-       } 
-   else  {
-      // failed CRC
-      #ifdef DEBUG
-        print_CRC(F("CRC BAD"));
-      #endif    
-    }
-
-    digitalWrite(LED, LOW);
-  }
-
-  //delay(100);
+   }
+   return true;
 }
 
-void print_CRC(String status){
-  int i;
-  for (i=0; i<8; i++) {
-    Serial.print(buf[i],HEX);
-    Serial.print(" ");
-  }
-  Serial.println(status);
-}
-
-bool isUploadDevice()
+/* Interrupt 1 handler 
+ * Tied to pin 3 INT1 of arduino.
+ * Set to interrupt on edge (level change) high or low transition.
+ * Change the state of the Arduino LED (pin 13) on each interrupt. 
+ * This allows scoping pin 13 to see the interrupt / data pulse train.
+ */
+void handler() 
 {
-  int deviceID[2];
-  deviceID[0] = buf[0] & 63;
-  deviceID[1] = buf[1];
-  if (memcmp_P(deviceID , uploadDevice,2) == 0)
-    return true;
-  else
-    return false;
-  
+   static unsigned long duration = 0;
+   static unsigned long lastTime = 0;
+   static unsigned int ringIndex = 0;
+   static unsigned int syncCount = 0;
+   static unsigned int bitState  = 0;
+
+   bitState = digitalRead(DATAPIN);
+   digitalWrite(13, bitState);
+
+   // ignore if we haven't finished processing the previous 
+   // received signal in the main loop.
+   if( received == true )
+   {
+      return;
+   }
+
+   // calculating timing since last change
+   long time = micros();
+   duration = time - lastTime;
+   lastTime = time;
+
+   // Known error in bit stream is runt/short pulses.
+   // If we ever get a really short, or really long, 
+   // pulse we know there is an error in the bit stream
+   // and should start over.
+   if( (duration > (PULSE_LONG+PULSE_RANGE)) || (duration < (PULSE_SHORT-PULSE_RANGE)) )
+   {
+     //Check to see if we have received a minimum number of bits we could take
+     
+     if (syncFound  && changeCount >= DATABITSEDGES_MIN)
+     {
+       if (changeCount >= DATABYTESCNT_MID)
+       {
+         bytesReceived = 8;
+       } else {
+         bytesReceived = 7;
+       }
+       received = true;
+       return;
+
+     } else {
+      received = false;
+      syncFound = false;
+      changeCount = 0;  // restart looking for data bits
+     }
+     
+
+      digitalWrite(LAPIN, LOW);
+   }
+
+   // store data in ring buffer
+   ringIndex = (ringIndex + 1) % RING_BUFFER_SIZE;
+   pulseDurations[ringIndex] = duration;
+   changeCount++; // found another edge
+
+   // detect sync signal
+   if( isSync(ringIndex) )
+   {
+      syncFound = true;
+      changeCount = 0;  // restart looking for data bits
+      syncIndex = ringIndex;
+      dataIndex = (syncIndex + 1)%RING_BUFFER_SIZE;
+      digitalWrite(LAPIN, HIGH);
+   }
+
+   // If a sync has been found the start looking for the
+   // DATABITSEDGES data bit edges.
+   if( syncFound )
+   {
+      // if not enough bits yet, no message received yet
+      if( changeCount < DATABITSEDGES_MAX )
+      {
+        
+         received = false;
+      }
+      else if( changeCount > DATABITSEDGES_MAX )
+      {
+        // if too many bits received then reset and start over
+         received = false;
+         syncFound = false;
+         digitalWrite(LAPIN, LOW);
+      }
+      else
+      {
+         received = true;
+         bytesReceived = 9;
+         digitalWrite(LAPIN, LOW);
+      }
+   }
 }
 
-void identifyDevice()
+
+void setup()
 {
-  Serial.print("Device ID: ");
-  Serial.print(buf[0] & 63,HEX);
-  Serial.print(buf[1],HEX);
-  Serial.print(" Channel: ");
-  Serial.print(channelID[buf[0]>>6]);
-  Serial.print(" ");
+   Serial.begin(9600);
+   Serial.println("Started.");
+   pinMode(DATAPIN, INPUT);             // data interrupt input
+   pinMode(13, OUTPUT);                 // LED output
+   pinMode(LAPIN, OUTPUT);
+   digitalWrite(LAPIN, LOW);
+   attachInterrupt(1, handler, CHANGE);
+   pinMode(SQUELCHPIN, OUTPUT);         // data squelch pin on radio module
+   digitalWrite(SQUELCHPIN, HIGH);      // UN-squelch data
+   
 }
 
-bool acurite_crc(volatile byte row[], int cols) {
+/*
+ * Convert pulse durations to bits.
+ * 
+ * 1 bit ~0.4 msec high followed by ~0.2 msec low
+ * 0 bit ~0.2 msec high followed by ~0.4 msec low
+ */
+int convertTimingToBit(unsigned int t0, unsigned int t1) 
+{
+   if( t0 > (BIT1_HIGH_MIN) && t0 < (BIT1_HIGH_MAX) && t1 > (BIT1_LOW_MIN) && t1 < (BIT1_LOW_MAX) )
+   {
+      return 1;
+   }
+   else if( t0 > (BIT0_HIGH_MIN) && t0 < (BIT0_HIGH_MAX) && t1 > (BIT0_LOW_MIN) && t1 < (BIT0_LOW_MAX) )
+   {
+      return 0;
+   }
+   return -1;  // undefined
+}
+
+/*
+ * Validate the CRC value to validate the packet
+ *
+ *
+ */
+bool acurite_crc(volatile byte row[]) {
       // sum of first n-1 bytes modulo 256 should equal nth byte
-      cols -= 1; // last byte is CRC
-        int sum = 0;
-      for (int i = 0; i < cols; i++) {
+      int sum = 0;
+
+      for (int i = 0; i < bytesReceived -1; i++) {
         sum += row[i];
       }    
-      if (sum != 0 && sum % 256 == row[cols]) {
+      if (sum != 0 && sum % 256 == row[bytesReceived -1]) {
         return true;
       } else {
+        
+        Serial.print("Expected: ");
+        Serial.print(row[bytesReceived-1], HEX);
+        Serial.print(" Got: ");
+        Serial.println(sum%256, HEX);
         return false;
       }
 }
 
-bool wundergrnd_send()
-{
-//  String request = WUnderURL;
-//  for (int i=0; i < sizeof(WunderOpts); i++)
-//  {
-//    request += WunderOpts[i];
-//    request += WunderVal[i];
-//  }
-//
-//  Serial.print(request);
-  
+/*
+ * Acurite 06045 Lightning sensor Temperature encoding
+ * 12 bits of temperature after removing parity and status bits.
+ * Message native format appears to be in 1/10 of a degree Fahrenheit
+ * Device Specification: -40 to 158 F  / -40 to 70 C
+ * Available range given encoding with 12 bits -150.0 F to +259.6 F
+ */
+float acurite_6045_getTemp (uint8_t highbyte, uint8_t lowbyte) {
+    int rawtemp = ((highbyte & 0x1F) << 7) | (lowbyte & 0x7F);
+    float temp = (rawtemp - 1500) / 10.0;
+    return temp;
 }
 
-void TempAndHumid(bool smallDevice)
-{
-  // Tempature and Humidity
-  float tempf = getTempF(buf[4], buf[5]);
-  bool batteryok = ((buf[2] & 0x40) >> 6);
-  int humidity;
-  
-  if (smallDevice) {
-    humidity = getHumidity(buf[3]);
-  } else {
-    humidity = getHumidity(buf[6]);
-  }
-   
-  Serial.print("temp: ");
-  if (METRIC_UNITS) {
-    Serial.print(convFC(tempf), 1);
-    Serial.print(" C, ");
-  } else {
-    Serial.print(tempf, 1);
-    Serial.print(" F, ");
-  }
- // WunderVal[6] = String(tempf,1);  //Tempature
-  Serial.print("humidity: ");
-  Serial.print(humidity);
-  //WunderVal[5] = String(humidity,0);  //Humidity
-  Serial.print(" %RH, battery: ");
-  if (batteryok) {
-    Serial.print("OK");
-  } else {
-    Serial.print("LOW");
-  }
-  return;
-}
-
-float getTempF(byte hibyte, byte lobyte) {
+float acurite_getTemp_6044M(byte hibyte, byte lobyte) {
   // range -40 to 158 F
   int highbits = (hibyte & 0x0F) << 7;
   int lowbits = lobyte & 0x7F;
   int rawtemp = highbits | lowbits;
-  float temp = (rawtemp - 400) / 10.0;
+  float temp = (rawtemp / 10.0) - 100;
   return temp;
 }
 
-float getWindSpeed(byte hibyte, byte lobyte) {
-  // range: 0 to 159 kph
-  int highbits = (hibyte & 0x7F) << 3;
-  int lowbits = (lobyte & 0x7F) >> 4;
-  float speed = highbits | lowbits;
-  // speed in m/s formula according to empirical data
-  if (speed > 0) {
-    speed = speed * 0.23 + 0.28;
-  }
-  float kph = speed * 60 * 60 / 1000;
-  return kph;
+float convCF(float c) {
+  return ((c * 1.8) +32);
 }
 
-float getWindDirection(byte b) {
+int acurite_6045_strikeCnt(byte strikeByte)
+{
+  //int strikeTot = 0;
+  //int strikeWrapOffset = 0;
+  int strikeCnt = strikeByte & 0x7f;
+  int compStrike = 0;
+  if (strikeTot = 0)
+  {
+    //Initialize Strike Counter
+    strikeTot = strikeCnt;
+    strikeWrapOffset = 0;
+    compStrike = 0;
+  } else if (strikeCnt < strikeTot && strikeCnt > 0){
+/*Strikes wrapped around  
+ *  Setting strikeTot to 1 as zero would cause a reset, 
+ *   Need to make sure strikeCnt isn't 0 so we don't get 
+ *   127 false strikes added to our wrap around
+ */
+    strikeWrapOffset = (127 - strikeTot) + strikeWrapOffset;
+    strikeTot = 1;
+    compStrike = (strikeCnt - strikeTot) + strikeWrapOffset;
+  } else  {
+    compStrike = (strikeCnt - strikeTot) + strikeWrapOffset;
+  }
+  return compStrike;
+}
+
+uint8_t acurite_6045_strikeRange(uint8_t strikeRange)
+{
+  return strikeRange & 0x1f;
+}
+
+uint16_t acurite_txr_getSensorId(uint8_t hibyte, uint8_t lobyte){
+    return ((hibyte & 0x3f) << 8) | lobyte;
+}
+
+int acurite_5n1_getBatteryLevel(uint8_t byte){
+    return (byte & 0x40) >> 6;
+}
+
+int acurite_getHumidity (uint8_t byte) {
+    // range: 1 to 99 %RH
+    int humidity = byte & 0x7F;
+    return humidity;
+}
+
+float acurite_getWindSpeed_kph (uint8_t highbyte, uint8_t lowbyte) {
+    // range: 0 to 159 kph
+    // raw number is cup rotations per 4 seconds
+    // http://www.wxforum.net/index.php?topic=27244.0 (found from weewx driver)
+	 int highbits = ( highbyte & 0x1F) << 3;
+   int lowbits = ( lowbyte & 0x70 ) >> 4;
+   int rawspeed = highbits | lowbits;
+   float speed_kph = 0;
+   if (rawspeed > 0) {
+   speed_kph = rawspeed * 0.8278 + 1.0;
+    }
+    return speed_kph;
+}
+
+char * getWindDirection_Descr(byte b) {
   // 16 compass points, ccw from (NNW) to 15 (N), 
         // { "NW", "WSW", "WNW", "W", "NNW", "SW", "N", "SSW",
         //   "ENE", "SE", "E", "ESE", "NE", "SSE", "NNE", "S" };
   int direction = b & 0x0F;
-  return winddirections[direction];
+  return acurite_5n1_winddirection_str[direction];
 }
 
-int getHumidity(byte b) {
-  // range: 1 to 99 %RH
-  int humidity = b & 0x7F;
-  return humidity;
+
+float acurite_getTemp_5n1(byte highbyte, byte lowbyte) {
+    // range -40 to 158 F
+    int highbits = (highbyte & 0x0F) << 7 ;
+    int lowbits = lowbyte & 0x7F;
+    int rawtemp = highbits | lowbits;
+    float temp_F = (rawtemp - 400) / 10.0;
+    return temp_F;
 }
 
-int getRainfallCounter(byte hibyte, byte lobyte) {
-  // range: 0 to 99.99 in, 0.01 increment rolling counter
-  int raincounter = ((hibyte & 0x7f) << 7) | (lobyte & 0x7F);
-  return raincounter;
+float acurite_getRainfall(uint8_t hibyte, uint8_t lobyte) {
+    // range: 0 to 99.99 in, 0.01 in incr., rolling counter?
+	int raincounter = ((hibyte & 0x7f) << 7) | (lobyte & 0x7F);
+	if (acurite_5n1_raincounter > 0)
+	{
+	 if (raincounter < acurite_5n1_raincounter)
+	  {
+	    rainWrapOffset=lastRainCount - acurite_5n1_raincounter;
+	    acurite_5n1_raincounter = 0;
+	  } else {
+	    lastRainCount = raincounter;
+	  }
+	return (raincounter - acurite_5n1_raincounter + rainWrapOffset) * .01;
+
+	} else {
+	  acurite_5n1_raincounter = raincounter;
+	  lastRainCount = raincounter;
+    return 0.0;
+	}
+
+	
 }
 
 float convKphMph(float kph) {
   return kph * 0.62137;
 }
 
-float convFC(float f) {
-  return (f-32) / 1.8;
-}
-
-float convInMm(float in) {
-  return in * 25.4;
-}
-
-unsigned int getRaincounterEEPROM() {
-  unsigned int oldraincounter = 0;
-  unsigned int marker = eeprom_read_word(&eeprom_marker);
-  #ifdef DEBUG 
-    Serial.print("marker: ");
-    Serial.print(marker, HEX);
-  #endif
-  if (marker == MARKER) {
-    // we have written before, use old value
-    oldraincounter = eeprom_read_word(&raincounter_persist);
-    #ifdef DEBUG
-      Serial.print(", raincounter_persist raw value: ");
-      Serial.println(raincounter, HEX);
-    #endif 
-  } 
-  return oldraincounter;
-}
-
-void updateRaincounterEEPROM(unsigned int raincounter) {
-  eeprom_update_word(&raincounter_persist, raincounter);
-  eeprom_update_word(&eeprom_marker, MARKER); // indicate first write
-  #ifdef DEBUG
-    Serial.print("updateraincountereeprom: ");
-    Serial.print(eeprom_read_word(&raincounter_persist), HEX);
-    Serial.print(", eeprommarker: ");
-    Serial.print(eeprom_read_word(&eeprom_marker), HEX);
-    Serial.println();
-  #endif
-}
-
-void My_ISR()
+void decode_5n1(byte dataBytes[])
 {
-  // decode the pulses
-  unsigned long timestamp = micros();
-  
-  if (digitalRead(PIN) == HIGH) {
-    // going high, start timing
-    if (timestamp - risets > RESETTIME) {
-      // detect reset condition
-      state=RESET;
-      syncpulses=0;
-      pulsecnt=0;
-    }
-    risets = timestamp;
-    return;
-  }
-
-  // going low
-  unsigned long duration = timestamp - risets;
-
-  if (state == RESET || state == INSYNC) {
-    // looking for sync pulses
-    if ((SYNC_LO) < duration && duration < (SYNC_HI))  {
-      // start counting sync pulses
-      state=INSYNC;
-      syncpulses++;
-      if (syncpulses > 3) {
-        // found complete sync header
-        state = SYNCDONE;
-        syncpulses = 0;
-        pulsecnt=0;
-        
-        #ifdef DEBUG
-          // quick debug to trigger logic analyzer at sync
-          digitalWrite(DEBUGPIN, LOW);
-        #endif
-      }
-      return; 
-      
-    } else { 
-      // not interested, reset  
-      syncpulses=0;
-      pulsecnt=0;
-      state=RESET;
-      #ifdef DEBUG
-        digitalWrite(DEBUGPIN, HIGH); //return trigger
-      #endif
-      return; 
-    }
-  } else {
-    
-    // SYNCDONE, now look for message 
-    // detect if finished here
-    if ( pulsecnt > MAXBITS ) {
-      noInterrupts();
-      state = RESET;
-      pulsecnt = 0;
-      if (!rngBuf->isFull(rngBuf)) {
-        rngBuf->add(rngBuf, &recBuf);
-      }
-      interrupts();
-      return;
-    }
-    // stuff buffer with message
-    
-    byte bytepos = pulsecnt / 8;
-    byte bitpos = 7 - (pulsecnt % 8); // reverse bitorder
-    if ( LONG_LO < duration && duration < LONG_HI) {
-      bitSet(buf[bytepos], bitpos);
-      pulsecnt++;
-    }
-    else if ( SHORT_LO < duration && duration < SHORT_HI) {
-    
-      bitClear(buf[bytepos], bitpos);
-      pulsecnt++;
-    }
-  
-  }
-}
-void TestISR()
-{
-  int i;
-  char readbuf[16];
-  Serial.println("Awaiting input");
-  Serial.setTimeout(60000);
-  Serial.readBytes(readbuf,16);
-
-  for (i=0;i<16;i+=2)
-    {
-    buf[i/2]=x2i(&readbuf[i]);
-    }
-  
-  Serial.print("Value : ");
-  
-  for (i=0;i<8;i++)
+    Serial.print("Acurite 5n1 Tower - ");
+    Serial.print(acurite_txr_getSensorId(dataBytes[0], dataBytes[1]), HEX);
+    Serial.print(" Windspeed - ");
+    Serial.print(convKphMph(acurite_getWindSpeed_kph(dataBytes[3], dataBytes[4])));
+  if ((dataBytes[2] & 0x3F) == MT_WS_WD_RF)
   {
-   Serial.print(buf[i],HEX);
-   Serial.print(" ");
+    // Wind Speed, Direction and Rainfall
+    Serial.print(" Direction - ");
+    Serial.print(getWindDirection_Descr(dataBytes[4]));
+    Serial.print(" Rainfall - ");
+    Serial.print(acurite_getRainfall(dataBytes[5], dataBytes[6]));
+  } else {
+    // Wind speed, Temp, Humidity
+    Serial.print(" Temp - ");
+    Serial.print(acurite_getTemp_5n1(dataBytes[4], dataBytes[5]));
+    Serial.print(" Humidity - ");
+    Serial.print(acurite_getHumidity(dataBytes[6]));
   }
-
-}
-
-int x2i(char *s) 
-{
- int i;
- int x = 0;
- for(i=0;i<2;i++) {
-   char c = *s;
-   Serial.print(c);
-   if (c >= '0' && c <= '9') {
-      x *= 16;
-      x += c - '0'; 
-   }
-   else if (c >= 'A' && c <= 'F') {
-      x *= 16;
-      x += (c - 'A') + 10; 
-   }
-   else if (c >= 'a' && c <= 'f') {
-      x *= 16;
-      x += (c - 'a') + 10;   
-   }
-   else break;
-   s++;
- }
+  
   Serial.println();
- return x;
+  
 }
+
+
+
+void decode_Acurite_6044(byte dataBytes[])
+{
+  Serial.print("Acurite 6044 Tower - ");
+  Serial.print(acurite_txr_getSensorId(dataBytes[0], dataBytes[1]), HEX);
+  Serial.print(" Temp - ");
+  Serial.print(convCF(acurite_getTemp_6044M(dataBytes[4], dataBytes[5])));
+  Serial.print(" Humidity - ");
+  Serial.print(acurite_getHumidity(dataBytes[3]));
+  Serial.print(" %");
+  if ((dataBytes[4] & 0x20) == 0x20 )
+  {
+    Serial.print("Battery Low;");
+  }
+  Serial.println();
+}
+
+void decode_Acurite_6045(byte dataBytes[])
+{
+  Serial.print("Acurite 6045 Lightning - ");
+  Serial.print(acurite_txr_getSensorId(dataBytes[0], dataBytes[1]), HEX);
+  Serial.print(" Temp - ");
+  Serial.print(acurite_6045_getTemp (dataBytes[4], dataBytes[5]));
+  Serial.print(" Humidity - ");
+  Serial.print(acurite_getHumidity(dataBytes[3]));
+  Serial.print(" % Lightning - ");
+  if ((dataBytes[4] & 0x40) == 0x40 )
+  {
+    if ((dataBytes[7] & 0x20) == 0x20)
+    {
+      Serial.print("Interference");
+    } else {
+    Serial.print("Detected; Dist - ");
+    Serial.print(acurite_6045_strikeRange(dataBytes[7]));
+    Serial.print(" miles; Count - ");
+    Serial.print(acurite_6045_strikeCnt(dataBytes[6]));
+    Serial.print("; ");
+    }
+  } else
+  {
+    Serial.print("None; ");
+  }
+  if ((dataBytes[4] & 0x20) == 0x20 )
+  {
+    Serial.print("Battery Low;");
+  }
+  Serial.println();
+}
+
+
+
+// Print the bit stream for debugging. 
+// Generates a lot of chatter, normally disable this.
+void displayBitTiming()
+{
+  unsigned int ringIndex;
+  
+        Serial.print("syncFound = ");
+      Serial.println(syncFound);
+      Serial.print("changeCount = ");
+      Serial.println(changeCount);
+      Serial.print("bytesReceived = ");
+      Serial.println(bytesReceived);
+      Serial.print("syncIndex = ");
+      Serial.println(syncIndex);
+
+      Serial.print("dataIndex = ");
+      Serial.println(dataIndex);
+
+      ringIndex = (syncIndex - (SYNCPULSEEDGES-1))%RING_BUFFER_SIZE;
+
+      for( int i = 0; i < (SYNCPULSECNT+(bytesReceived*8)); i++ )
+      {
+         int bit = convertTimingToBit( pulseDurations[ringIndex%RING_BUFFER_SIZE], 
+                                       pulseDurations[(ringIndex+1)%RING_BUFFER_SIZE] );
+
+         Serial.print("bit ");
+         Serial.print( i );
+         Serial.print(" = ");
+         Serial.print(bit);
+         Serial.print(" t1 = ");
+         Serial.print(pulseDurations[ringIndex%RING_BUFFER_SIZE]);
+         Serial.print(" t2 = ");
+         Serial.println(pulseDurations[(ringIndex+1)%RING_BUFFER_SIZE]);
+
+         ringIndex += 2;
+      }
+  
+}
+
+/*
+ * Main Loop
+ * Wait for received to be true, meaning a sync stream plus
+ * all of the data bit edges have been found.
+ * Convert all of the pulse timings to bits and calculate
+ * the results.
+ */
+void loop()
+{
+   if( received == true )
+   {
+      // disable interrupt to avoid new data corrupting the buffer
+      detachInterrupt(1);
+
+      // extract temperature value
+      unsigned int startIndex, stopIndex, ringIndex;
+      unsigned long temperature = 0;
+      bool fail = false;
+
+//define DISPLAY_BIT_TIMING 
+#ifdef DISPLAY_BIT_TIMING
+  displayBitTiming();
+#endif // DISPLAY_BIT_TIMING
+
+//Decode to Hex Bytes
+      byte dataBytes[bytesReceived];
+      fail = false; // reset bit decode error flag
+
+      // clear the data bytes array
+      for( int i = 0; i < bytesReceived; i++ )
+      {
+        dataBytes[i] = 0;
+      }
+        
+      ringIndex = (syncIndex+1)%RING_BUFFER_SIZE;
+
+      for( int i = 0; i < bytesReceived * 8; i++ )
+      {
+         int bit = convertTimingToBit( pulseDurations[ringIndex%RING_BUFFER_SIZE], 
+                                       pulseDurations[(ringIndex+1)%RING_BUFFER_SIZE] );
+                                       
+         if( bit < 0 )
+         {  
+            fail = true;
+            break;      // exit loop
+         }
+         else
+         {
+            dataBytes[i/8] |= bit << (7-(i%8));
+         }
+         
+         ringIndex += 2;
+      }
+
+     
+
+// Display the raw data received in hex
+#define DISPLAY_DATA_BYTES
+#ifdef DISPLAY_DATA_BYTES
+ 
+ if (fail)
+      {
+         Serial.println("Data Byte Display : Decoding error.");
+
+      } else {
+              for( int i = 0; i < bytesReceived; i++ )
+              {
+                PrintHex8(&dataBytes[i], 1);
+                //Serial.print(dataBytes[i], HEX);
+                Serial.print(",");
+              }
+              Serial.println();
+      
+//              for( int i = 0; i < bytesReceived; i++ )
+//              {
+//                Serial.print(dataBytes[i], BIN);
+//                Serial.print(",");
+//              }
+//              //Serial.println();
+   }
+
+#endif  
+
+if (fail)
+  {
+    Serial.println("Decode Error ");
+  } else if (bytesReceived == 7)  {
+    //Small Tower sensor with Temp and Humidity Only
+    decode_Acurite_6044(dataBytes);
+  } else if (bytesReceived==8) {
+    //5n1 tower sensor 
+    decode_5n1(dataBytes);
+  } else if (bytesReceived==9) {
+    //Lightening detector
+    decode_Acurite_6045(dataBytes);
+    
+  }       
+ 
+ 
+ 
+ 
+ 
+               
+     
+      // delay for 1 second to avoid repetitions
+      delay(1000);
+      received = false;
+      syncFound = false;
+
+      // re-enable interrupt
+      attachInterrupt(1, handler, CHANGE);
+   }
+}
+
