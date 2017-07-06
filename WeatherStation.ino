@@ -81,6 +81,20 @@
 #define  MT_WS_WD_RF  49    // wind speed, wind direction, rainfall
 #define  MT_WS_T_RH   56    // wind speed, temp, RH
 
+#define eventTimeoutms 7200000  //Timeout in miliseconds before an event is over
+
+// macros from DateTime.h 
+/* Useful Constants */
+#define SECS_PER_MIN  (60UL)
+#define SECS_PER_HOUR (3600UL)
+#define SECS_PER_DAY  (SECS_PER_HOUR * 24L)
+
+/* Useful Macros for getting elapsed time */
+#define numberOfSeconds(_time_) (_time_ % SECS_PER_MIN)  
+#define numberOfMinutes(_time_) ((_time_ / SECS_PER_MIN) % SECS_PER_MIN) 
+#define numberOfHours(_time_) (( _time_% SECS_PER_DAY) / SECS_PER_HOUR)
+#define elapsedDays(_time_) ( _time_ / SECS_PER_DAY)  
+
 
 // The pulse durations are the measured time in micro seconds between
 // pulse edges.
@@ -95,9 +109,14 @@ unsigned int bytesReceived = 0;
 int acurite_5n1_raincounter = 0;
 int rainWrapOffset = 0;
 int lastRainCount = 0;
+bool activeRain = false;
+unsigned long rainLast = 0;
 
 int strikeTot = 0;
 int strikeWrapOffset = 0;
+int lastStrikeCount = 0;
+bool activeStrikes = false;
+unsigned long strikeLast = 0;
 
 
 //const unsigned int tempOffset = 2.4;  // offset in degrees C
@@ -367,26 +386,39 @@ int acurite_6045_strikeCnt(byte strikeByte)
   //int strikeTot = 0;
   //int strikeWrapOffset = 0;
   int strikeCnt = strikeByte & 0x7f;
-  int compStrike = 0;
-  if (strikeTot = 0)
+  if (strikeTot == 0)
   {
     //Initialize Strike Counter
     strikeTot = strikeCnt;
     strikeWrapOffset = 0;
-    compStrike = 0;
+    strikeLast = millis();
+    activeStrikes = false;
+    return 0;
   } else if (strikeCnt < strikeTot && strikeCnt > 0){
-/*Strikes wrapped around  
- *  Setting strikeTot to 1 as zero would cause a reset, 
- *   Need to make sure strikeCnt isn't 0 so we don't get 
- *   127 false strikes added to our wrap around
- */
+    /*Strikes wrapped around  
+     *  Setting strikeTot to 1 as zero would cause a reset, 
+     *   Need to make sure strikeCnt isn't 0 so we don't get 
+     *   127 false strikes added to our wrap around
+     */
     strikeWrapOffset = (127 - strikeTot) + strikeWrapOffset;
     strikeTot = 1;
-    compStrike = (strikeCnt - strikeTot) + strikeWrapOffset;
-  } else  {
-    compStrike = (strikeCnt - strikeTot) + strikeWrapOffset;
+    strikeLast = millis();
+    activeStrikes = true;
+  } else if ( strikeCnt == strikeTot) {
+    if (millis() - strikeLast > eventTimeoutms)    {
+      //Reset the Lightning event time its been more than the eventTiemoutms
+      strikeTot = strikeCnt;
+      strikeWrapOffset = 0;
+      activeStrikes = false;
+      //strikeLast = millis();
+    }
+  } else {
+    //strike occured increase lastStrike
+    strikeLast = millis();
+    activeStrikes = true;
   }
-  return compStrike;
+  return (strikeCnt - strikeTot) + strikeWrapOffset;
+  
 }
 
 uint8_t acurite_6045_strikeRange(uint8_t strikeRange)
@@ -447,20 +479,40 @@ float acurite_getRainfall(uint8_t hibyte, uint8_t lobyte) {
 	{
 	 if (raincounter < acurite_5n1_raincounter)
 	  {
-	    rainWrapOffset=lastRainCount - acurite_5n1_raincounter;
-	    acurite_5n1_raincounter = 0;
+	    rainWrapOffset= lastRainCount - acurite_5n1_raincounter;
+	    acurite_5n1_raincounter = 1;
+	    rainLast = millis();
+	    activeRain = true;
+	  } else if (acurite_5n1_raincounter == raincounter){
+	    if ((millis() - rainLast) >= eventTimeoutms)  {
+	    	    lastRainCount = raincounter;
+	    	    rainWrapOffset = 0;
+	    	    activeRain = false;
+	    	  }  
 	  } else {
-	    lastRainCount = raincounter;
+	    rainLast = millis();
+	    activeRain = false;
 	  }
-	return (raincounter - acurite_5n1_raincounter + rainWrapOffset) * .01;
-
+	  return (raincounter - acurite_5n1_raincounter + rainWrapOffset) * .01;
 	} else {
 	  acurite_5n1_raincounter = raincounter;
 	  lastRainCount = raincounter;
+	  rainLast = millis();
+	  activeRain = false;
     return 0.0;
 	}
+}
 
-	
+String getTimeSpan(unsigned long startMillis, unsigned long endMillis)
+{
+  String outString;
+  long span = (endMillis - startMillis) / 1000;
+  outString.concat(numberOfHours(span));
+  outString.concat(":");
+  outString.concat(numberOfMinutes(span));
+  outString.concat(":");
+  outString.concat(numberOfSeconds(span));
+  return outString;
 }
 
 float convKphMph(float kph) {
@@ -471,23 +523,33 @@ void decode_5n1(byte dataBytes[])
 {
     Serial.print("Acurite 5n1 Tower - ");
     Serial.print(acurite_txr_getSensorId(dataBytes[0], dataBytes[1]), HEX);
-    Serial.print(" Windspeed - ");
+    Serial.print("; Windspeed - ");
     Serial.print(convKphMph(acurite_getWindSpeed_kph(dataBytes[3], dataBytes[4])));
   if ((dataBytes[2] & 0x3F) == MT_WS_WD_RF)
   {
     // Wind Speed, Direction and Rainfall
-    Serial.print(" Direction - ");
+    Serial.print("; Direction - ");
     Serial.print(getWindDirection_Descr(dataBytes[4]));
     Serial.print(" Rainfall - ");
     Serial.print(acurite_getRainfall(dataBytes[5], dataBytes[6]));
+    if (activeRain){
+    Serial.print("; Last rain event - ");
+    Serial.print(getTimeSpan(rainLast, millis()));
+    }
+    Serial.print(";");
   } else {
     // Wind speed, Temp, Humidity
-    Serial.print(" Temp - ");
+    Serial.print("; Temp - ");
     Serial.print(acurite_getTemp_5n1(dataBytes[4], dataBytes[5]));
-    Serial.print(" Humidity - ");
+    Serial.print("; Humidity - ");
     Serial.print(acurite_getHumidity(dataBytes[6]));
+    Serial.print("%");
   }
   
+  if ((dataBytes[4] & 0x20) == 0x20 )
+  {
+    Serial.print(" Battery Low;");
+  }
   Serial.println();
   
 }
@@ -498,11 +560,11 @@ void decode_Acurite_6044(byte dataBytes[])
 {
   Serial.print("Acurite 6044 Tower - ");
   Serial.print(acurite_txr_getSensorId(dataBytes[0], dataBytes[1]), HEX);
-  Serial.print(" Temp - ");
+  Serial.print("; Temp - ");
   Serial.print(convCF(acurite_getTemp_6044M(dataBytes[4], dataBytes[5])));
-  Serial.print(" Humidity - ");
+  Serial.print("; Humidity - ");
   Serial.print(acurite_getHumidity(dataBytes[3]));
-  Serial.print(" %");
+  Serial.print(" %;");
   if ((dataBytes[4] & 0x20) == 0x20 )
   {
     Serial.print("Battery Low;");
@@ -514,12 +576,12 @@ void decode_Acurite_6045(byte dataBytes[])
 {
   Serial.print("Acurite 6045 Lightning - ");
   Serial.print(acurite_txr_getSensorId(dataBytes[0], dataBytes[1]), HEX);
-  Serial.print(" Temp - ");
+  Serial.print("; Temp - ");
   Serial.print(acurite_6045_getTemp (dataBytes[4], dataBytes[5]));
-  Serial.print(" Humidity - ");
+  Serial.print("; Humidity - ");
   Serial.print(acurite_getHumidity(dataBytes[3]));
-  Serial.print(" % Lightning - ");
-  if ((dataBytes[4] & 0x40) == 0x40 )
+  Serial.print(" %; Lightning - ");
+  if (((dataBytes[7] & 0x40) == 0x40) || activeStrikes)
   {
     if ((dataBytes[7] & 0x20) == 0x20)
     {
@@ -529,7 +591,9 @@ void decode_Acurite_6045(byte dataBytes[])
     Serial.print(acurite_6045_strikeRange(dataBytes[7]));
     Serial.print(" miles; Count - ");
     Serial.print(acurite_6045_strikeCnt(dataBytes[6]));
-    Serial.print("; ");
+    Serial.print("; Last Strike -  ");
+    Serial.print(getTimeSpan(strikeLast, millis()));
+    Serial.print(";");
     }
   } else
   {
@@ -537,7 +601,7 @@ void decode_Acurite_6045(byte dataBytes[])
   }
   if ((dataBytes[4] & 0x20) == 0x20 )
   {
-    Serial.print("Battery Low;");
+    Serial.print(" Battery Low;");
   }
   Serial.println();
 }
@@ -654,7 +718,7 @@ void loop()
                 //Serial.print(dataBytes[i], HEX);
                 Serial.print(",");
               }
-              Serial.println();
+
       
 //              for( int i = 0; i < bytesReceived; i++ )
 //              {
@@ -668,7 +732,7 @@ void loop()
 
 if (fail)
   {
-    Serial.println("Decode Error ");
+
   } else if (bytesReceived == 7)  {
     //Small Tower sensor with Temp and Humidity Only
     decode_Acurite_6044(dataBytes);
@@ -677,17 +741,9 @@ if (fail)
     decode_5n1(dataBytes);
   } else if (bytesReceived==9) {
     //Lightening detector
-    decode_Acurite_6045(dataBytes);
-    
+    decode_Acurite_6045(dataBytes);  
   }       
- 
- 
- 
- 
- 
-               
-     
-      // delay for 1 second to avoid repetitions
+       // delay for 1 second to avoid repetitions
       delay(1000);
       received = false;
       syncFound = false;
